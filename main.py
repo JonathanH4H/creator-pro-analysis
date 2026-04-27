@@ -1,3 +1,4 @@
+import asyncio
 import os
 from typing import Any
 
@@ -62,11 +63,31 @@ class IngestYouTubeRequest(BaseModel):
     config: dict[str, Any]
 
 
-@app.post("/ingest/youtube")
-def ingest_youtube(
+@app.post("/ingest/youtube", status_code=202)
+async def ingest_youtube(
     body: IngestYouTubeRequest,
     authorization: str | None = Header(default=None),
 ):
     verify_secret(authorization)
     sb = get_supabase()
-    return ingest_youtube_channel(sb, body.analysis_id, body.channel_id, body.config)
+
+    # Pragmatic background pattern for internal Phase 1a use. ingest_youtube_channel
+    # is sync (supabase-py, yt-dlp, youtube-transcript-api are all sync), so we run
+    # it in a worker thread via asyncio.to_thread and let the request return 202.
+    #
+    # Limitation: tasks live in the uvicorn worker process. uvicorn restart kills
+    # in-flight ingestions (no resumption; analyses row stays at 'running' until
+    # Inngest's MAX_POLLS timeout marks the function failed). Migrate to a real
+    # task queue (Celery / Arq / RQ) before scaling beyond internal — see
+    # PRE_LAUNCH_TODO.md "Reliability".
+    asyncio.create_task(
+        asyncio.to_thread(
+            ingest_youtube_channel,
+            sb,
+            body.analysis_id,
+            body.channel_id,
+            body.config,
+        )
+    )
+
+    return {"status": "accepted", "analysis_id": body.analysis_id}

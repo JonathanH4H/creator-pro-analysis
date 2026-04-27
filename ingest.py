@@ -5,6 +5,7 @@ from typing import Any
 import httpx
 from supabase import Client
 
+from transcripts import transcribe_video
 from youtube_client import YouTubeClient, YouTubeQuotaError, chunks
 
 
@@ -113,6 +114,35 @@ def ingest_youtube_channel(
             if (i + 1) % 10 == 0 or (i + 1) == total_to_ingest:
                 _emit_progress(
                     sb, analysis_id, stage="downloading_thumbnails",
+                    current=i + 1, total=total_to_ingest,
+                )
+
+        # Stage 5: transcripts. Whisper is the primary path (default true);
+        # youtube-transcript-api is the toggle-off cost-conscious override.
+        # `whisper_fallback` is the vestigial config-key name from chunk 1
+        # (see lib/validation/analysis.ts comment).
+        #
+        # Sequential by design — a parallelism shim (asyncio.gather + semaphore
+        # of 5) is a ~5x speedup if needed, isolated to this loop, no
+        # architectural impact. Defer until a real reason emerges (operator
+        # complaint, demo dragging, downstream feature requirement).
+        use_whisper = bool(config.get("whisper_fallback", True))
+        _emit_progress(
+            sb, analysis_id, stage="fetching_transcripts",
+            current=0, total=total_to_ingest,
+        )
+        for i, v in enumerate(videos_to_ingest):
+            text, source = transcribe_video(
+                v["platform_video_id"], use_whisper=use_whisper
+            )
+            sb.table("videos").update(
+                {"transcript": text, "transcript_source": source}
+            ).eq("platform_account_id", platform_account_id).eq(
+                "platform_video_id", v["platform_video_id"]
+            ).execute()
+            if (i + 1) % 10 == 0 or (i + 1) == total_to_ingest:
+                _emit_progress(
+                    sb, analysis_id, stage="fetching_transcripts",
                     current=i + 1, total=total_to_ingest,
                 )
 
