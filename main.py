@@ -1,5 +1,4 @@
 import os
-from datetime import datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
@@ -7,6 +6,8 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
+
+from ingest import ingest_youtube_channel
 
 load_dotenv()
 app = FastAPI(title="Creator Pro Analysis Service")
@@ -67,20 +68,5 @@ def ingest_youtube(
     authorization: str | None = Header(default=None),
 ):
     verify_secret(authorization)
-
-    # Phase 1a Chunk 2: stub. Mark the run as running and write one progress
-    # event. Real ingestion (video listing, metadata, transcripts, comments)
-    # lands in chunks 3-5.
     sb = get_supabase()
-    progress = {
-        "stage": "started",
-        "current": 0,
-        "total": 0,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "errors": [],
-    }
-    sb.table("analyses").update(
-        {"status": "running", "pipeline_progress": progress}
-    ).eq("id", body.analysis_id).execute()
-
-    return {"ok": True, "analysis_id": body.analysis_id}
+    return ingest_youtube_channel(sb, body.analysis_id, body.channel_id, body.config)
