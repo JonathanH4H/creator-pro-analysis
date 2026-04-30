@@ -43,6 +43,30 @@ class YouTubeClient:
         self.units_used += units
         return resp.json()
 
+    def fetch_video_comments(
+        self, platform_video_id: str, max_results: int, channel_id: str
+    ) -> list[dict]:
+        # Top-level only, ordered by relevance. commentsDisabled is a normal
+        # condition on YouTube — surface as empty list rather than error.
+        try:
+            data = self._request(
+                "commentThreads",
+                {
+                    "part": "snippet",
+                    "videoId": platform_video_id,
+                    "order": "relevance",
+                    "maxResults": min(max_results, 100),
+                    "textFormat": "plainText",
+                },
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403 and "commentsDisabled" in e.response.text:
+                return []
+            raise
+        return [
+            _normalize_comment(item, channel_id) for item in data.get("items", [])
+        ]
+
     def get_uploads_playlist_id(self, channel_id: str) -> str:
         data = self._request("channels", {"part": "contentDetails", "id": channel_id})
         items = data.get("items", [])
@@ -98,6 +122,19 @@ def _normalize_video(item: dict) -> dict:
             thumbnails.get("high", {}).get("url")
             or thumbnails.get("default", {}).get("url")
         ),
+    }
+
+
+def _normalize_comment(item: dict, channel_id: str) -> dict:
+    top = item.get("snippet", {}).get("topLevelComment", {}).get("snippet", {})
+    author_channel_id = (top.get("authorChannelId") or {}).get("value")
+    return {
+        "platform_comment_id": item.get("id"),
+        "author": top.get("authorDisplayName"),
+        "text": top.get("textDisplay"),
+        "like_count": int(top.get("likeCount", 0) or 0),
+        "is_creator_reply": author_channel_id == channel_id,
+        "published_at": top.get("publishedAt"),
     }
 
 

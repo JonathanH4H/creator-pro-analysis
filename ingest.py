@@ -146,6 +146,31 @@ def ingest_youtube_channel(
                     current=i + 1, total=total_to_ingest,
                 )
 
+        # Stage 6: comments. Top-level only, ordered by relevance. Per spec
+        # chunk 5: fetch for every selected video; idempotent upsert dedupes
+        # on re-run. commentsDisabled is empty-list-continue, not failure.
+        comments_per_video = int(config.get("comments_per_video", 50))
+        video_uuid_by_pvid = _fetch_video_uuid_map(
+            sb, platform_account_id, [v["platform_video_id"] for v in videos_to_ingest]
+        )
+        _emit_progress(
+            sb, analysis_id, stage="fetching_comments",
+            current=0, total=total_to_ingest,
+        )
+        for i, v in enumerate(videos_to_ingest):
+            video_uuid = video_uuid_by_pvid[v["platform_video_id"]]
+            comments = client.fetch_video_comments(
+                v["platform_video_id"], comments_per_video, channel_id
+            )
+            for c in comments:
+                _upsert_comment(sb, video_uuid, c)
+            if (i + 1) % 10 == 0 or (i + 1) == total_to_ingest:
+                _emit_progress(
+                    sb, analysis_id, stage="fetching_comments",
+                    current=i + 1, total=total_to_ingest,
+                )
+                _persist_units(sb, analysis_id, client.units_used)
+
         sb.table("analyses").update({
             "status": "completed",
             "completed_at": _utcnow_iso(),
@@ -204,6 +229,26 @@ def _upsert_video(sb: Client, platform_account_id: str, video: dict):
     }
     sb.table("videos").upsert(
         payload, on_conflict="platform_account_id,platform_video_id"
+    ).execute()
+
+
+def _fetch_video_uuid_map(
+    sb: Client, platform_account_id: str, platform_video_ids: list[str]
+) -> dict[str, str]:
+    rows = (
+        sb.table("videos")
+        .select("id, platform_video_id")
+        .eq("platform_account_id", platform_account_id)
+        .in_("platform_video_id", platform_video_ids)
+        .execute()
+    )
+    return {r["platform_video_id"]: r["id"] for r in rows.data}
+
+
+def _upsert_comment(sb: Client, video_uuid: str, comment: dict):
+    payload = {"video_id": video_uuid, **comment}
+    sb.table("comments").upsert(
+        payload, on_conflict="video_id,platform_comment_id"
     ).execute()
 
 
