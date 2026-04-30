@@ -93,6 +93,20 @@ def ingest_youtube_channel(
         videos_to_ingest = [v for v in all_videos if v["platform_video_id"] in selected]
         total_to_ingest = len(videos_to_ingest)
 
+        # Re-ingestion partition. Stage 3 (upsert) runs on every selected video
+        # so view/like/comment counts on existing rows get refreshed. Stages 4,
+        # 5, 6 (thumbnails, transcripts, comments) run on new videos only —
+        # these are expensive (Whisper $$, comments quota) and the data on
+        # existing rows is either unchanged (transcripts/thumbnails) or, per
+        # Phase 1a constraint, intentionally not refreshed (comments).
+        existing_pvids = _fetch_existing_pvids(
+            sb, platform_account_id, [v["platform_video_id"] for v in videos_to_ingest]
+        )
+        new_videos = [
+            v for v in videos_to_ingest if v["platform_video_id"] not in existing_pvids
+        ]
+        total_new = len(new_videos)
+
         # Stage 3: write videos
         _emit_progress(sb, analysis_id, stage="writing_videos", current=0, total=total_to_ingest)
         for i, v in enumerate(videos_to_ingest):
@@ -104,17 +118,17 @@ def ingest_youtube_channel(
                 )
 
         # Stage 4: thumbnails (bucket is public, service role bypasses RLS for write)
-        _emit_progress(sb, analysis_id, stage="downloading_thumbnails", current=0, total=total_to_ingest)
-        for i, v in enumerate(videos_to_ingest):
+        _emit_progress(sb, analysis_id, stage="downloading_thumbnails", current=0, total=total_new)
+        for i, v in enumerate(new_videos):
             path = _upload_thumbnail(sb, platform_account_id, v)
             if path:
                 sb.table("videos").update({"thumbnail_storage_path": path}).eq(
                     "platform_account_id", platform_account_id
                 ).eq("platform_video_id", v["platform_video_id"]).execute()
-            if (i + 1) % 10 == 0 or (i + 1) == total_to_ingest:
+            if (i + 1) % 10 == 0 or (i + 1) == total_new:
                 _emit_progress(
                     sb, analysis_id, stage="downloading_thumbnails",
-                    current=i + 1, total=total_to_ingest,
+                    current=i + 1, total=total_new,
                 )
 
         # Stage 5: transcripts. Whisper is the primary path (default true);
@@ -129,9 +143,9 @@ def ingest_youtube_channel(
         use_whisper = bool(config.get("whisper_fallback", True))
         _emit_progress(
             sb, analysis_id, stage="fetching_transcripts",
-            current=0, total=total_to_ingest,
+            current=0, total=total_new,
         )
-        for i, v in enumerate(videos_to_ingest):
+        for i, v in enumerate(new_videos):
             text, source = transcribe_video(
                 v["platform_video_id"], use_whisper=use_whisper
             )
@@ -140,34 +154,35 @@ def ingest_youtube_channel(
             ).eq("platform_account_id", platform_account_id).eq(
                 "platform_video_id", v["platform_video_id"]
             ).execute()
-            if (i + 1) % 10 == 0 or (i + 1) == total_to_ingest:
+            if (i + 1) % 10 == 0 or (i + 1) == total_new:
                 _emit_progress(
                     sb, analysis_id, stage="fetching_transcripts",
-                    current=i + 1, total=total_to_ingest,
+                    current=i + 1, total=total_new,
                 )
 
-        # Stage 6: comments. Top-level only, ordered by relevance. Per spec
-        # chunk 5: fetch for every selected video; idempotent upsert dedupes
-        # on re-run. commentsDisabled is empty-list-continue, not failure.
+        # Stage 6: comments. Top-level only, ordered by relevance. New videos
+        # only — Phase 1a constraint per spec chunk 6: existing videos do not
+        # get their comments refreshed. Idempotent upsert dedupes within a run.
+        # commentsDisabled is empty-list-continue, not failure.
         comments_per_video = int(config.get("comments_per_video", 50))
         video_uuid_by_pvid = _fetch_video_uuid_map(
-            sb, platform_account_id, [v["platform_video_id"] for v in videos_to_ingest]
+            sb, platform_account_id, [v["platform_video_id"] for v in new_videos]
         )
         _emit_progress(
             sb, analysis_id, stage="fetching_comments",
-            current=0, total=total_to_ingest,
+            current=0, total=total_new,
         )
-        for i, v in enumerate(videos_to_ingest):
+        for i, v in enumerate(new_videos):
             video_uuid = video_uuid_by_pvid[v["platform_video_id"]]
             comments = client.fetch_video_comments(
                 v["platform_video_id"], comments_per_video, channel_id
             )
             for c in comments:
                 _upsert_comment(sb, video_uuid, c)
-            if (i + 1) % 10 == 0 or (i + 1) == total_to_ingest:
+            if (i + 1) % 10 == 0 or (i + 1) == total_new:
                 _emit_progress(
                     sb, analysis_id, stage="fetching_comments",
-                    current=i + 1, total=total_to_ingest,
+                    current=i + 1, total=total_new,
                 )
                 _persist_units(sb, analysis_id, client.units_used)
 
@@ -232,6 +247,21 @@ def _upsert_video(sb: Client, platform_account_id: str, video: dict):
     ).execute()
 
 
+def _fetch_existing_pvids(
+    sb: Client, platform_account_id: str, platform_video_ids: list[str]
+) -> set[str]:
+    if not platform_video_ids:
+        return set()
+    rows = (
+        sb.table("videos")
+        .select("platform_video_id")
+        .eq("platform_account_id", platform_account_id)
+        .in_("platform_video_id", platform_video_ids)
+        .execute()
+    )
+    return {r["platform_video_id"] for r in rows.data}
+
+
 def _fetch_video_uuid_map(
     sb: Client, platform_account_id: str, platform_video_ids: list[str]
 ) -> dict[str, str]:
@@ -267,6 +297,9 @@ def _upload_thumbnail(sb: Client, platform_account_id: str, video: dict) -> str 
         )
         return path
     except Exception:
-        # Thumbnail failures are tolerable: video row is created without
-        # thumbnail_storage_path; a re-run can populate it later.
+        # Thumbnail failures are tolerated to avoid blocking ingestion of an
+        # otherwise-good video row. Caveat: chunk 6 re-ingestion skips this
+        # stage for existing videos, so a silently-failed thumbnail leaves
+        # the row permanently without thumbnail_storage_path. See
+        # PRE_LAUNCH_TODO "Reliability" for fix options.
         return None
