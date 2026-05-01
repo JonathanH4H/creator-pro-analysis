@@ -1,16 +1,15 @@
-"""DNA extraction harness (Phase 1b.1).
+"""DNA extraction harness.
 
-Provides extract_claims_from_bucket() — runs an LLM extraction pass over a
-bucket of videos, verifies citations against transcripts via substring match,
-and writes verified claims to dna_claims with archive-then-insert semantics.
+Generic primitives for any DNA pass:
+- extract_claims_from_bucket: LLM extraction over a bucket of videos +
+  citation verification (substring match against transcripts).
+- synthesize_claims: source-index merging across bucket-level claims.
+  LLM picks which input claims describe the same pattern; this module
+  mechanically unions evidence, so no hallucinated quotes are possible.
+- write_canonical_claims: archive-then-insert into dna_claims.
 
-1b.1 ships the harness only. No real pass implemented yet — verification uses
-a stub llm_call. Real passes (lexical_voice, etc.) arrive in 1b.2+.
-
-Prompt caching deliberately not added in 1b.1 since the harness only ever
-invokes a stub llm_call here. Add cache_control on the system prompt + tool
-schema (and possibly the user message for stable buckets) when 1b.2 ships a
-real pass and caching becomes load-bearing.
+Pass-specific prompts and orchestration live in per-pass modules
+(e.g., lexical_voice.py).
 """
 
 from __future__ import annotations
@@ -76,8 +75,10 @@ def _default_llm_call(system_prompt: str, user_message: str) -> dict:
     client = Anthropic()
     response = client.messages.create(
         model=MODEL,
-        max_tokens=4096,
-        system=system_prompt,
+        max_tokens=8192,
+        system=[
+            {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
+        ],
         tools=[RECORD_CLAIMS_TOOL],
         tool_choice={"type": "tool", "name": "record_claims"},
         messages=[{"role": "user", "content": user_message}],
@@ -86,6 +87,65 @@ def _default_llm_call(system_prompt: str, user_message: str) -> dict:
         if getattr(block, "type", None) == "tool_use" and block.name == "record_claims":
             return block.input
     raise RuntimeError("Anthropic response did not include record_claims tool use")
+
+
+RECORD_CANONICAL_CLAIMS_TOOL = {
+    "name": "record_canonical_claims",
+    "description": (
+        "Merge per-bucket claims into deduplicated canonical claims by "
+        "referencing source claim indexes from the input list. Do not "
+        "rewrite or invent evidence — that is handled by the orchestrator."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "canonical_claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "claim_text": {"type": "string"},
+                        "confidence_score": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
+                        "source_claim_indexes": {
+                            "type": "array",
+                            "items": {"type": "integer", "minimum": 0},
+                            "minItems": 1,
+                        },
+                    },
+                    "required": ["claim_text", "source_claim_indexes"],
+                },
+            }
+        },
+        "required": ["canonical_claims"],
+    },
+}
+
+
+def _default_synthesis_call(system_prompt: str, user_message: str) -> dict:
+    client = Anthropic()
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=8192,
+        system=[
+            {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
+        ],
+        tools=[RECORD_CANONICAL_CLAIMS_TOOL],
+        tool_choice={"type": "tool", "name": "record_canonical_claims"},
+        messages=[{"role": "user", "content": user_message}],
+    )
+    for block in response.content:
+        if (
+            getattr(block, "type", None) == "tool_use"
+            and block.name == "record_canonical_claims"
+        ):
+            return block.input
+    raise RuntimeError(
+        "Anthropic response did not include record_canonical_claims tool use"
+    )
 
 
 def _build_user_message(video_bucket: list[dict]) -> str:
@@ -135,17 +195,30 @@ def extract_claims_from_bucket(
     *,
     llm_call: LlmCall | None = None,
     model_version: str | None = None,
+    write_to_db: bool = True,
 ) -> dict[str, Any]:
-    """Run extraction, verify citations, archive prior active claims for
-    (creator_id, pass_name), insert verified claims.
+    """Run extraction over a bucket of videos, verify each citation against
+    the cited transcript, optionally archive-then-insert.
 
     video_bucket: list of {"id": uuid, "transcript": text|None}. id must
     match videos.id; transcript must equal videos.transcript so substring
     verification is meaningful.
 
-    Returns {"written": int, "rejected": int, "rejected_reasons": [str]}.
     Per-claim verification is all-or-nothing: any failing piece of evidence
     rejects the entire claim.
+
+    write_to_db=True (default): archive prior active claims for
+    (creator_id, pass_name) then insert accepted claims. Used by the 1b.1
+    stub harness.
+
+    write_to_db=False: return accepted claims to caller, no DB writes. Used
+    by orchestrators that combine multiple buckets through synthesis before
+    persisting.
+
+    Returns {"written": int, "rejected": int, "rejected_reasons": [str],
+    "accepted_claims": [dict]}. "written" == count of accepted claims
+    regardless of write_to_db (the value is just whether they were also
+    persisted).
     """
     llm = llm_call or _default_llm_call
     version = model_version or MODEL
@@ -184,23 +257,106 @@ def extract_claims_from_bucket(
 
         accepted.append(claim)
 
-    if accepted:
-        _archive_existing(sb, creator_id, pass_name)
-        rows = [
-            {
-                "creator_id": creator_id,
-                "pass_name": pass_name,
-                "claim_text": c["claim_text"],
-                "evidence_json": c["evidence"],
-                "confidence_score": c.get("confidence_score"),
-                "model_version": version,
-            }
-            for c in accepted
-        ]
-        sb.table("dna_claims").insert(rows).execute()
+    if accepted and write_to_db:
+        write_canonical_claims(
+            sb, creator_id, pass_name, accepted, model_version=version
+        )
 
     return {
         "written": len(accepted),
         "rejected": len(rejected_reasons),
         "rejected_reasons": rejected_reasons,
+        "accepted_claims": accepted,
     }
+
+
+def synthesize_claims(
+    input_claims: list[dict],
+    system_prompt: str,
+    *,
+    llm_call: LlmCall | None = None,
+) -> list[dict]:
+    """Merge per-bucket claims into canonical claims via source-index merging.
+
+    The LLM emits canonical_claims with source_claim_indexes pointing into
+    the flattened input list. This function then mechanically unions
+    evidence from the referenced source claims (deduped by
+    (video_id, exact_quote)). The LLM never emits evidence, so hallucinated
+    quotes are structurally impossible.
+
+    Returns canonical claims with shape {claim_text, confidence_score,
+    evidence}. Empty list if input is empty or LLM produces no usable
+    canonical claims.
+    """
+    if not input_claims:
+        return []
+
+    llm = llm_call or _default_synthesis_call
+
+    lines = []
+    for i, c in enumerate(input_claims):
+        text = (c.get("claim_text") or "").replace("</claim>", "")
+        lines.append(f'<claim index="{i}">{text}</claim>')
+    user_message = "\n".join(lines)
+
+    response = llm(system_prompt, user_message)
+    canonical = response.get("canonical_claims", [])
+
+    n = len(input_claims)
+    result: list[dict] = []
+    for cc in canonical:
+        indexes = cc.get("source_claim_indexes") or []
+        valid = [i for i in indexes if isinstance(i, int) and 0 <= i < n]
+        if not valid:
+            continue
+        evidence_seen: set[tuple] = set()
+        merged_evidence: list[dict] = []
+        for i in valid:
+            for ev in input_claims[i].get("evidence", []):
+                key = (ev.get("video_id"), ev.get("exact_quote"))
+                if key in evidence_seen:
+                    continue
+                evidence_seen.add(key)
+                merged_evidence.append(ev)
+        if not merged_evidence:
+            continue
+        result.append(
+            {
+                "claim_text": cc["claim_text"],
+                "confidence_score": cc.get("confidence_score"),
+                "evidence": merged_evidence,
+            }
+        )
+
+    return result
+
+
+def write_canonical_claims(
+    sb: Client,
+    creator_id: str,
+    pass_name: str,
+    claims: list[dict],
+    *,
+    model_version: str | None = None,
+) -> int:
+    """Archive prior active claims for (creator_id, pass_name), insert the
+    given claims. Returns rows inserted. Each claim must have shape
+    {claim_text, evidence, confidence_score?}.
+    """
+    if not claims:
+        return 0
+    _archive_existing(sb, creator_id, pass_name)
+    version = model_version or MODEL
+    rows = [
+        {
+            "creator_id": creator_id,
+            "pass_name": pass_name,
+            "claim_text": c["claim_text"],
+            "evidence_json": c["evidence"],
+            "confidence_score": c.get("confidence_score"),
+            "model_version": version,
+        }
+        for c in claims
+    ]
+    sb.table("dna_claims").insert(rows).execute()
+    return len(rows)
