@@ -75,7 +75,7 @@ def _default_llm_call(system_prompt: str, user_message: str) -> dict:
     client = Anthropic()
     response = client.messages.create(
         model=MODEL,
-        max_tokens=8192,
+        max_tokens=16384,
         system=[
             {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
         ],
@@ -83,6 +83,14 @@ def _default_llm_call(system_prompt: str, user_message: str) -> dict:
         tool_choice={"type": "tool", "name": "record_claims"},
         messages=[{"role": "user", "content": user_message}],
     )
+    # Truncation in a forced tool call leaves block.input as `{}` — silent
+    # zero-claims. Surface as a hard error so the orchestrator's per-bucket
+    # try/except logs it instead of treating it as a successful empty bucket.
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError(
+            f"Anthropic response hit max_tokens (output={response.usage.output_tokens}); "
+            "tool call was truncated. Reduce bucket size or raise max_tokens."
+        )
     for block in response.content:
         if getattr(block, "type", None) == "tool_use" and block.name == "record_claims":
             return block.input
@@ -129,7 +137,7 @@ def _default_synthesis_call(system_prompt: str, user_message: str) -> dict:
     client = Anthropic()
     response = client.messages.create(
         model=MODEL,
-        max_tokens=8192,
+        max_tokens=16384,
         system=[
             {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
         ],
@@ -137,6 +145,11 @@ def _default_synthesis_call(system_prompt: str, user_message: str) -> dict:
         tool_choice={"type": "tool", "name": "record_canonical_claims"},
         messages=[{"role": "user", "content": user_message}],
     )
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError(
+            f"Anthropic synthesis hit max_tokens (output={response.usage.output_tokens}); "
+            "tool call was truncated. Reduce intermediate-claims input or raise max_tokens."
+        )
     for block in response.content:
         if (
             getattr(block, "type", None) == "tool_use"
