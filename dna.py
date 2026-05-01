@@ -72,17 +72,23 @@ LlmCall = Callable[[str, str], dict]
 
 
 def _default_llm_call(system_prompt: str, user_message: str) -> dict:
+    # Streaming is required by the SDK once max_tokens crosses its
+    # "operations may take longer than 10 minutes" threshold. Output budget
+    # for verbose creators can run high; using stream() unlocks the full
+    # 64K Sonnet ceiling. get_final_message() returns the same Message
+    # shape as messages.create(), so downstream parsing is unchanged.
     client = Anthropic()
-    response = client.messages.create(
+    with client.messages.stream(
         model=MODEL,
-        max_tokens=32000,
+        max_tokens=64000,
         system=[
             {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
         ],
         tools=[RECORD_CLAIMS_TOOL],
         tool_choice={"type": "tool", "name": "record_claims"},
         messages=[{"role": "user", "content": user_message}],
-    )
+    ) as stream:
+        response = stream.get_final_message()
     # Truncation in a forced tool call leaves block.input as `{}` — silent
     # zero-claims. Surface as a hard error so the orchestrator's per-bucket
     # try/except logs it instead of treating it as a successful empty bucket.
@@ -135,16 +141,17 @@ RECORD_CANONICAL_CLAIMS_TOOL = {
 
 def _default_synthesis_call(system_prompt: str, user_message: str) -> dict:
     client = Anthropic()
-    response = client.messages.create(
+    with client.messages.stream(
         model=MODEL,
-        max_tokens=32000,
+        max_tokens=64000,
         system=[
             {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
         ],
         tools=[RECORD_CANONICAL_CLAIMS_TOOL],
         tool_choice={"type": "tool", "name": "record_canonical_claims"},
         messages=[{"role": "user", "content": user_message}],
-    )
+    ) as stream:
+        response = stream.get_final_message()
     if response.stop_reason == "max_tokens":
         raise RuntimeError(
             f"Anthropic synthesis hit max_tokens (output={response.usage.output_tokens}); "
