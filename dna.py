@@ -14,6 +14,7 @@ Pass-specific prompts and orchestration live in per-pass modules
 
 from __future__ import annotations
 
+import random
 import re
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -380,3 +381,115 @@ def write_canonical_claims(
     ]
     sb.table("dna_claims").insert(rows).execute()
     return len(rows)
+
+
+def run_extraction_pass(
+    creator_id: str,
+    sb: Client,
+    *,
+    pass_name: str,
+    system_prompt: str,
+    synthesis_prompt: str,
+    bucket_size: int = 10,
+    min_bucket_success_ratio: float = 0.5,
+    llm_call: LlmCall | None = None,
+) -> dict[str, Any]:
+    """Generic orchestrator for a DNA extraction pass.
+
+    Pipeline:
+      1. Fetch creator's videos with non-null transcripts.
+      2. Deterministic shuffle (seeded from creator_id) into buckets.
+      3. Per-bucket LLM extraction with citation verification — log-and-
+         continue on failure. Abort if <min_bucket_success_ratio succeed.
+      4. LLM synthesis via source-index merging (no hallucinated evidence).
+      5. Archive prior active claims for (creator_id, pass_name).
+      6. Insert canonical claims.
+
+    Pass-specific modules (lexical_voice, structural_voice, topical_voice,
+    ...) wrap this with their own pass_name and prompts.
+
+    Returns counts: {buckets_total, buckets_succeeded, intermediate_claims,
+    canonical_claims_written}.
+    """
+    pa_rows = (
+        sb.table("platform_accounts")
+        .select("id")
+        .eq("creator_id", creator_id)
+        .execute()
+    ).data
+    if not pa_rows:
+        raise ValueError(f"No platform_accounts for creator_id={creator_id}")
+    pa_ids = [r["id"] for r in pa_rows]
+
+    videos = (
+        sb.table("videos")
+        .select("id, transcript")
+        .in_("platform_account_id", pa_ids)
+        .not_.is_("transcript", "null")
+        .execute()
+    ).data
+    videos = [v for v in videos if v.get("transcript")]
+    if not videos:
+        raise ValueError(f"No transcripts found for creator_id={creator_id}")
+
+    rng = random.Random(creator_id)
+    rng.shuffle(videos)
+    buckets = [videos[i : i + bucket_size] for i in range(0, len(videos), bucket_size)]
+    print(
+        f"[{pass_name}] {len(videos)} transcripts → {len(buckets)} buckets "
+        f"of up to {bucket_size}"
+    )
+
+    intermediate: list[dict] = []
+    succeeded = 0
+    for i, bucket in enumerate(buckets):
+        try:
+            result = extract_claims_from_bucket(
+                creator_id,
+                pass_name,
+                system_prompt,
+                bucket,
+                sb,
+                llm_call=llm_call,
+                write_to_db=False,
+            )
+            print(
+                f"[{pass_name}] bucket {i + 1}/{len(buckets)}: "
+                f"{result['written']} accepted, {result['rejected']} rejected"
+            )
+            intermediate.extend(result["accepted_claims"])
+            succeeded += 1
+        except Exception as e:
+            print(
+                f"[{pass_name}] bucket {i + 1}/{len(buckets)} FAILED: "
+                f"{type(e).__name__}: {e}"
+            )
+
+    success_ratio = succeeded / len(buckets)
+    if success_ratio < min_bucket_success_ratio:
+        raise RuntimeError(
+            f"Only {succeeded}/{len(buckets)} buckets succeeded "
+            f"({success_ratio:.0%} < {min_bucket_success_ratio:.0%}). "
+            f"Aborting before synthesis."
+        )
+    if not intermediate:
+        raise RuntimeError("No claims extracted across all buckets. Aborting.")
+
+    print(f"[{pass_name}] synthesizing {len(intermediate)} intermediate claims...")
+    canonical = synthesize_claims(
+        intermediate, synthesis_prompt, llm_call=llm_call
+    )
+    if not canonical:
+        raise RuntimeError("Synthesis returned 0 canonical claims. Aborting.")
+    print(f"[{pass_name}] synthesized → {len(canonical)} canonical claims")
+
+    written = write_canonical_claims(
+        sb, creator_id, pass_name, canonical, model_version=MODEL
+    )
+
+    return {
+        "buckets_total": len(buckets),
+        "buckets_succeeded": succeeded,
+        "intermediate_claims": len(intermediate),
+        "canonical_claims_written": written,
+    }

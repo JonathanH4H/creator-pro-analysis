@@ -1,32 +1,20 @@
 """Structural voice DNA pass (Phase 1b.3).
 
-Second real DNA extraction pass. Extracts how a creator organizes a video —
-opening, closing, transitions, story insertion, and CTA patterns.
-
-Mirrors lexical_voice.py shape. The orchestrator (run_pass) is duplicated
-intentionally; queue an extraction into dna.run_extraction_pass when chunk
-1b.4 ships a third pass and the abstraction has three real callers.
+Extracts how a creator organizes a video — opening, closing, transitions,
+story insertion, and CTA patterns. Thin wrapper around
+dna.run_extraction_pass holding pass-specific prompts.
 """
 
 from __future__ import annotations
 
-import random
 from typing import Any
 
 from supabase import Client
 
-from dna import (
-    LlmCall,
-    MODEL,
-    extract_claims_from_bucket,
-    synthesize_claims,
-    write_canonical_claims,
-)
+from dna import LlmCall, run_extraction_pass
 
 
 PASS_NAME = "structural_voice"
-DEFAULT_BUCKET_SIZE = 10
-MIN_BUCKET_SUCCESS_RATIO = 0.5
 
 
 STRUCTURAL_VOICE_SYSTEM_PROMPT = """You are an expert in creator voice analysis. You will be given a set of YouTube video transcripts from a single creator. Your task is to identify structural voice patterns — how the creator organizes a video: opens, closes, transitions, inserts stories, and asks for action.
@@ -95,111 +83,21 @@ def run_pass(
     creator_id: str,
     sb: Client,
     *,
-    bucket_size: int = DEFAULT_BUCKET_SIZE,
+    bucket_size: int = 10,
     llm_call: LlmCall | None = None,
 ) -> dict[str, Any]:
     """Run the structural voice extraction pass end-to-end.
 
-    COST: ~$1.20-$1.40 per invocation against a typical ~30-95 transcript
-    channel. This makes real Anthropic API calls (claude-sonnet-4-6) — do
-    NOT invoke casually expecting $0. First-run pays full price; re-runs
-    benefit from system-prompt caching once the prompt crosses the cache
-    minimum, but transcripts are unique per bucket, so most of the cost
-    recurs. For zero-cost testing, pass a stub `llm_call`.
-
-    Pipeline mirrors lexical_voice.run_pass:
-      1. Fetch creator's videos with non-null transcripts.
-      2. Deterministic shuffle (seeded from creator_id) into buckets.
-      3. Per-bucket LLM extraction with citation verification — log-and-
-         continue on failure. Abort if <50% of buckets succeed.
-      4. LLM synthesis via source-index merging (no hallucinated evidence).
-      5. Archive prior active claims for (creator_id, structural_voice).
-      6. Insert canonical claims.
-
-    Returns counts: {buckets_total, buckets_succeeded, intermediate_claims,
-    canonical_claims_written}.
+    COST: ~$1.20-$1.40 per invocation against a typical channel. Real
+    Anthropic API calls (claude-sonnet-4-6) — do NOT invoke casually
+    expecting $0. For zero-cost testing, pass a stub `llm_call`.
     """
-    pa_rows = (
-        sb.table("platform_accounts")
-        .select("id")
-        .eq("creator_id", creator_id)
-        .execute()
-    ).data
-    if not pa_rows:
-        raise ValueError(f"No platform_accounts for creator_id={creator_id}")
-    pa_ids = [r["id"] for r in pa_rows]
-
-    videos = (
-        sb.table("videos")
-        .select("id, transcript")
-        .in_("platform_account_id", pa_ids)
-        .not_.is_("transcript", "null")
-        .execute()
-    ).data
-    videos = [v for v in videos if v.get("transcript")]
-    if not videos:
-        raise ValueError(f"No transcripts found for creator_id={creator_id}")
-
-    rng = random.Random(creator_id)
-    rng.shuffle(videos)
-    buckets = [videos[i : i + bucket_size] for i in range(0, len(videos), bucket_size)]
-    print(
-        f"[structural_voice] {len(videos)} transcripts → {len(buckets)} buckets "
-        f"of up to {bucket_size}"
+    return run_extraction_pass(
+        creator_id,
+        sb,
+        pass_name=PASS_NAME,
+        system_prompt=STRUCTURAL_VOICE_SYSTEM_PROMPT,
+        synthesis_prompt=STRUCTURAL_VOICE_SYNTHESIS_PROMPT,
+        bucket_size=bucket_size,
+        llm_call=llm_call,
     )
-
-    intermediate: list[dict] = []
-    succeeded = 0
-    for i, bucket in enumerate(buckets):
-        try:
-            result = extract_claims_from_bucket(
-                creator_id,
-                PASS_NAME,
-                STRUCTURAL_VOICE_SYSTEM_PROMPT,
-                bucket,
-                sb,
-                llm_call=llm_call,
-                write_to_db=False,
-            )
-            print(
-                f"[structural_voice] bucket {i + 1}/{len(buckets)}: "
-                f"{result['written']} accepted, {result['rejected']} rejected"
-            )
-            intermediate.extend(result["accepted_claims"])
-            succeeded += 1
-        except Exception as e:
-            print(
-                f"[structural_voice] bucket {i + 1}/{len(buckets)} FAILED: "
-                f"{type(e).__name__}: {e}"
-            )
-
-    success_ratio = succeeded / len(buckets)
-    if success_ratio < MIN_BUCKET_SUCCESS_RATIO:
-        raise RuntimeError(
-            f"Only {succeeded}/{len(buckets)} buckets succeeded "
-            f"({success_ratio:.0%} < {MIN_BUCKET_SUCCESS_RATIO:.0%}). "
-            f"Aborting before synthesis."
-        )
-    if not intermediate:
-        raise RuntimeError("No claims extracted across all buckets. Aborting.")
-
-    print(
-        f"[structural_voice] synthesizing {len(intermediate)} intermediate claims..."
-    )
-    canonical = synthesize_claims(
-        intermediate, STRUCTURAL_VOICE_SYNTHESIS_PROMPT, llm_call=llm_call
-    )
-    if not canonical:
-        raise RuntimeError("Synthesis returned 0 canonical claims. Aborting.")
-    print(f"[structural_voice] synthesized → {len(canonical)} canonical claims")
-
-    written = write_canonical_claims(
-        sb, creator_id, PASS_NAME, canonical, model_version=MODEL
-    )
-
-    return {
-        "buckets_total": len(buckets),
-        "buckets_succeeded": succeeded,
-        "intermediate_claims": len(intermediate),
-        "canonical_claims_written": written,
-    }
