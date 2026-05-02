@@ -8,7 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 
+import avatar_profile
 import lexical_voice
+import performance_profile
 import structural_voice
 import topical_voice
 from ingest import ingest_youtube_channel
@@ -100,6 +102,8 @@ PASS_RUNNERS = {
     "lexical_voice": lexical_voice.run_pass,
     "structural_voice": structural_voice.run_pass,
     "topical_voice": topical_voice.run_pass,
+    "avatar": avatar_profile.run_pass,
+    "performance": performance_profile.run_pass,
 }
 
 
