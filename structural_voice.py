@@ -11,7 +11,12 @@ from typing import Any
 
 from supabase import Client
 
-from dna import LlmCall, run_extraction_pass
+from dna import (
+    LlmCall,
+    VIDEO_TRANSCRIPT,
+    run_extraction_pass,
+    transcript_bucket_loader,
+)
 
 
 PASS_NAME = "structural_voice"
@@ -98,6 +103,7 @@ def run_pass(
         pass_name=PASS_NAME,
         system_prompt=STRUCTURAL_VOICE_SYSTEM_PROMPT,
         synthesis_prompt=STRUCTURAL_VOICE_SYNTHESIS_PROMPT,
-        bucket_size=bucket_size,
+        bucket_loader=transcript_bucket_loader(bucket_size),
+        evidence_source=VIDEO_TRANSCRIPT,
         llm_call=llm_call,
     )

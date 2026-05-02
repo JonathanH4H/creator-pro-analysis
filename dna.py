@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import random
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -35,87 +36,138 @@ MODEL_PRICING_USD: dict[str, dict[str, float]] = {
 }
 
 
-RECORD_CLAIMS_TOOL = {
-    "name": "record_claims",
-    "description": (
-        "Record extracted DNA claims with citations grounded in the provided "
-        "transcripts. Every claim must include at least one piece of evidence "
-        "with the exact quoted substring from the transcript."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "claims": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "claim_text": {"type": "string"},
-                        "confidence_score": {
-                            "type": "number",
-                            "minimum": 0,
-                            "maximum": 1,
-                        },
-                        "evidence": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "video_id": {"type": "string"},
-                                    "exact_quote": {"type": "string"},
-                                },
-                                "required": ["video_id", "exact_quote"],
+@dataclass(frozen=True)
+class EvidenceSource:
+    """Describes the kind of source text a pass extracts from.
+
+    citation_field — the key the LLM uses inside each evidence item to
+    point at the source (e.g., "video_id" for transcript-based passes,
+    "comment_id" for comment-based passes). Stored as-is in the
+    persisted evidence_json.
+
+    wrapper_tag / body_tag — XML tag names for the user_message wrapper
+    around each bucket item (e.g., <video><transcript>...</transcript></video>
+    or <comment><text>...</text></comment>).
+    """
+
+    citation_field: str
+    wrapper_tag: str
+    body_tag: str
+
+
+VIDEO_TRANSCRIPT = EvidenceSource("video_id", "video", "transcript")
+COMMENT_TEXT = EvidenceSource("comment_id", "comment", "text")
+
+
+# Bucket items are uniformly {"id": uuid, "source_text": text}. The pass-
+# specific loader is responsible for translating from videos.transcript or
+# comments.text into this shape.
+BucketLoader = Callable[[str, Client], list[list[dict]]]
+
+
+def _build_record_claims_tool(citation_field: str) -> dict:
+    return {
+        "name": "record_claims",
+        "description": (
+            "Record extracted DNA claims with citations grounded in the "
+            "provided source text. Every claim must include at least one "
+            "piece of evidence with the exact quoted substring from the "
+            "source."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "claims": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "claim_text": {"type": "string"},
+                            "confidence_score": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1,
                             },
-                            "minItems": 1,
+                            "evidence": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        citation_field: {"type": "string"},
+                                        "exact_quote": {"type": "string"},
+                                    },
+                                    "required": [citation_field, "exact_quote"],
+                                },
+                                "minItems": 1,
+                            },
                         },
+                        "required": ["claim_text", "evidence"],
                     },
-                    "required": ["claim_text", "evidence"],
-                },
-            }
+                }
+            },
+            "required": ["claims"],
         },
-        "required": ["claims"],
-    },
-}
+    }
 
 
 LlmCall = Callable[[str, str], dict]
 
 
-def _default_llm_call(system_prompt: str, user_message: str) -> dict:
-    # Streaming is required by the SDK once max_tokens crosses its
-    # "operations may take longer than 10 minutes" threshold. Output budget
-    # for verbose creators can run high; using stream() unlocks the full
-    # 64K Sonnet ceiling. get_final_message() returns the same Message
-    # shape as messages.create(), so downstream parsing is unchanged.
-    client = Anthropic()
-    with client.messages.stream(
-        model=MODEL,
-        max_tokens=64000,
-        system=[
-            {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
-        ],
-        tools=[RECORD_CLAIMS_TOOL],
-        tool_choice={"type": "tool", "name": "record_claims"},
-        messages=[{"role": "user", "content": user_message}],
-    ) as stream:
-        response = stream.get_final_message()
-    # Truncation in a forced tool call leaves block.input as `{}` — silent
-    # zero-claims. Surface as a hard error so the orchestrator's per-bucket
-    # try/except logs it instead of treating it as a successful empty bucket.
-    if response.stop_reason == "max_tokens":
+def _make_extract_call(citation_field: str) -> LlmCall:
+    """Build an Anthropic streaming call configured for the given citation
+    field. Returned closure matches the LlmCall signature.
+
+    Streaming is required by the SDK above its "operations may take longer
+    than 10 minutes" threshold. Output budget for verbose creators can run
+    high; stream() unlocks the full 64K Sonnet ceiling. get_final_message()
+    returns the same Message shape as messages.create().
+    """
+    tool = _build_record_claims_tool(citation_field)
+
+    def _call(system_prompt: str, user_message: str) -> dict:
+        client = Anthropic()
+        with client.messages.stream(
+            model=MODEL,
+            max_tokens=64000,
+            system=[
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            tools=[tool],
+            tool_choice={"type": "tool", "name": tool["name"]},
+            messages=[{"role": "user", "content": user_message}],
+        ) as stream:
+            response = stream.get_final_message()
+        # Truncation in a forced tool call leaves block.input as `{}` —
+        # silent zero-claims. Surface as a hard error so the orchestrator's
+        # per-bucket try/except logs it instead of treating it as success.
+        if response.stop_reason == "max_tokens":
+            raise RuntimeError(
+                f"Anthropic response hit max_tokens "
+                f"(output={response.usage.output_tokens}); tool call was "
+                "truncated. Reduce bucket size or raise max_tokens."
+            )
+        for block in response.content:
+            if (
+                getattr(block, "type", None) == "tool_use"
+                and block.name == tool["name"]
+            ):
+                tool_input = (
+                    dict(block.input) if isinstance(block.input, dict) else {}
+                )
+                tool_input["_anthropic_usage"] = {
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                }
+                return tool_input
         raise RuntimeError(
-            f"Anthropic response hit max_tokens (output={response.usage.output_tokens}); "
-            "tool call was truncated. Reduce bucket size or raise max_tokens."
+            "Anthropic response did not include record_claims tool use"
         )
-    for block in response.content:
-        if getattr(block, "type", None) == "tool_use" and block.name == "record_claims":
-            tool_input = dict(block.input) if isinstance(block.input, dict) else {}
-            tool_input["_anthropic_usage"] = {
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-            }
-            return tool_input
-    raise RuntimeError("Anthropic response did not include record_claims tool use")
+
+    return _call
 
 
 RECORD_CANONICAL_CLAIMS_TOOL = {
@@ -188,13 +240,13 @@ def _default_synthesis_call(system_prompt: str, user_message: str) -> dict:
     )
 
 
-def _build_user_message(video_bucket: list[dict]) -> str:
+def _build_user_message(bucket: list[dict], evidence_source: EvidenceSource) -> str:
     parts = []
-    for v in video_bucket:
+    for item in bucket:
         parts.append(
-            f'<video id="{v["id"]}"><transcript>'
-            f'{v.get("transcript") or ""}'
-            f'</transcript></video>'
+            f'<{evidence_source.wrapper_tag} id="{item["id"]}">'
+            f'<{evidence_source.body_tag}>{item.get("source_text") or ""}</{evidence_source.body_tag}>'
+            f'</{evidence_source.wrapper_tag}>'
         )
     return "\n".join(parts)
 
@@ -230,48 +282,55 @@ def extract_claims_from_bucket(
     creator_id: str,
     pass_name: str,
     system_prompt: str,
-    video_bucket: list[dict],
+    bucket: list[dict],
     sb: Client,
     *,
+    evidence_source: EvidenceSource = VIDEO_TRANSCRIPT,
     llm_call: LlmCall | None = None,
     model_version: str | None = None,
     write_to_db: bool = True,
 ) -> dict[str, Any]:
-    """Run extraction over a bucket of videos, verify each citation against
-    the cited transcript, optionally archive-then-insert.
+    """Run extraction over a bucket of source items, verify each citation
+    against the cited source's text, optionally archive-then-insert.
 
-    video_bucket: list of {"id": uuid, "transcript": text|None}. id must
-    match videos.id; transcript must equal videos.transcript so substring
-    verification is meaningful.
+    bucket: list of {"id": uuid, "source_text": text|None}. id must match
+    the persisted source row; source_text must equal that row's content
+    so substring verification is meaningful.
 
-    Per-claim verification is all-or-nothing: any failing piece of evidence
-    rejects the entire claim.
+    evidence_source: which kind of source the bucket holds. Drives the
+    LLM tool's citation field name, the user_message XML wrapping, and
+    the citation-key used for verification. Defaults to VIDEO_TRANSCRIPT
+    for backwards compatibility with voice passes.
+
+    Per-claim verification is all-or-nothing: any failing piece of
+    evidence rejects the entire claim.
 
     write_to_db=True (default): archive prior active claims for
-    (creator_id, pass_name) then insert accepted claims. Used by the 1b.1
-    stub harness.
+    (creator_id, pass_name) then insert accepted claims. Used by the
+    1b.1 stub harness.
 
-    write_to_db=False: return accepted claims to caller, no DB writes. Used
-    by orchestrators that combine multiple buckets through synthesis before
-    persisting.
+    write_to_db=False: return accepted claims to caller, no DB writes.
+    Used by orchestrators that combine multiple buckets through
+    synthesis before persisting.
 
-    Returns {"written": int, "rejected": int, "rejected_reasons": [str],
-    "accepted_claims": [dict]}. "written" == count of accepted claims
-    regardless of write_to_db (the value is just whether they were also
-    persisted).
+    Returns {"written", "rejected", "rejected_reasons", "accepted_claims",
+    "anthropic_usage"}. "written" == count of accepted claims regardless
+    of write_to_db (the value is just whether they were also persisted).
     """
-    llm = llm_call or _default_llm_call
+    llm = llm_call or _make_extract_call(evidence_source.citation_field)
     version = model_version or MODEL
 
-    transcript_by_id = {v["id"]: v.get("transcript") for v in video_bucket}
+    source_text_by_id = {item["id"]: item.get("source_text") for item in bucket}
 
-    user_message = _build_user_message(video_bucket)
+    user_message = _build_user_message(bucket, evidence_source)
     response = llm(system_prompt, user_message)
-    # Extract usage out of the LLM result so it doesn't leak into claim dicts
-    # written downstream. Stubs that don't populate _anthropic_usage produce
-    # None — the orchestrator's cost aggregation treats that as zero.
+    # Extract usage out of the LLM result so it doesn't leak into claim
+    # dicts written downstream. Stubs that don't populate _anthropic_usage
+    # produce None — the orchestrator's cost aggregation treats that as zero.
     usage = response.pop("_anthropic_usage", None)
     raw_claims = response.get("claims", [])
+
+    citation_field = evidence_source.citation_field
 
     accepted: list[dict] = []
     rejected_reasons: list[str] = []
@@ -285,13 +344,13 @@ def extract_claims_from_bucket(
 
         failure_reason: str | None = None
         for ev in evidence:
-            vid = ev.get("video_id")
+            src_id = ev.get(citation_field)
             quote = ev.get("exact_quote", "")
-            if vid not in transcript_by_id:
-                failure_reason = f"unknown video_id {vid}"
+            if src_id not in source_text_by_id:
+                failure_reason = f"unknown {citation_field} {src_id}"
                 break
-            if not _verify_quote(quote, transcript_by_id[vid]):
-                failure_reason = f"quote not found in video {vid}"
+            if not _verify_quote(quote, source_text_by_id[src_id]):
+                failure_reason = f"quote not found in {citation_field} {src_id}"
                 break
 
         if failure_reason:
@@ -319,6 +378,7 @@ def synthesize_claims(
     input_claims: list[dict],
     system_prompt: str,
     *,
+    evidence_source: EvidenceSource = VIDEO_TRANSCRIPT,
     llm_call: LlmCall | None = None,
 ) -> dict[str, Any]:
     """Merge per-bucket claims into canonical claims via source-index merging.
@@ -326,8 +386,9 @@ def synthesize_claims(
     The LLM emits canonical_claims with source_claim_indexes pointing into
     the flattened input list. This function then mechanically unions
     evidence from the referenced source claims (deduped by
-    (video_id, exact_quote)). The LLM never emits evidence, so hallucinated
-    quotes are structurally impossible.
+    (citation_id, exact_quote) where citation_id is the field named in
+    evidence_source.citation_field). The LLM never emits evidence, so
+    hallucinated quotes are structurally impossible.
 
     Returns {"canonical_claims": [...], "anthropic_usage": dict | None}.
     canonical_claims is empty if input is empty or LLM produces no usable
@@ -349,6 +410,7 @@ def synthesize_claims(
     usage = response.pop("_anthropic_usage", None)
     canonical = response.get("canonical_claims", [])
 
+    citation_field = evidence_source.citation_field
     n = len(input_claims)
     result: list[dict] = []
     for cc in canonical:
@@ -360,7 +422,7 @@ def synthesize_claims(
         merged_evidence: list[dict] = []
         for i in valid:
             for ev in input_claims[i].get("evidence", []):
-                key = (ev.get("video_id"), ev.get("exact_quote"))
+                key = (ev.get(citation_field), ev.get("exact_quote"))
                 if key in evidence_seen:
                     continue
                 evidence_seen.add(key)
@@ -409,6 +471,53 @@ def write_canonical_claims(
     return len(rows)
 
 
+def transcript_bucket_loader(bucket_size: int = 10) -> BucketLoader:
+    """Returns a bucket loader that fetches the creator's transcripts and
+    chunks them deterministically. Shared default for voice passes.
+
+    Items have shape {"id": video_uuid, "source_text": transcript_text}.
+    """
+
+    def _load(creator_id: str, sb: Client) -> list[list[dict]]:
+        pa_rows = (
+            sb.table("platform_accounts")
+            .select("id")
+            .eq("creator_id", creator_id)
+            .execute()
+        ).data
+        if not pa_rows:
+            raise ValueError(
+                f"No platform_accounts for creator_id={creator_id}"
+            )
+        pa_ids = [r["id"] for r in pa_rows]
+
+        rows = (
+            sb.table("videos")
+            .select("id, transcript")
+            .in_("platform_account_id", pa_ids)
+            .not_.is_("transcript", "null")
+            .execute()
+        ).data
+        items = [
+            {"id": r["id"], "source_text": r["transcript"]}
+            for r in rows
+            if r.get("transcript")
+        ]
+        if not items:
+            raise ValueError(
+                f"No transcripts found for creator_id={creator_id}"
+            )
+
+        rng = random.Random(creator_id)
+        rng.shuffle(items)
+        return [
+            items[i : i + bucket_size]
+            for i in range(0, len(items), bucket_size)
+        ]
+
+    return _load
+
+
 def run_extraction_pass(
     creator_id: str,
     sb: Client,
@@ -416,55 +525,38 @@ def run_extraction_pass(
     pass_name: str,
     system_prompt: str,
     synthesis_prompt: str,
-    bucket_size: int = 10,
+    bucket_loader: BucketLoader,
+    evidence_source: EvidenceSource = VIDEO_TRANSCRIPT,
     min_bucket_success_ratio: float = 0.5,
     llm_call: LlmCall | None = None,
 ) -> dict[str, Any]:
-    """Generic orchestrator for a DNA extraction pass.
+    """Generic orchestrator for a bucket-and-extract DNA pass.
 
     Pipeline:
-      1. Fetch creator's videos with non-null transcripts.
-      2. Deterministic shuffle (seeded from creator_id) into buckets.
-      3. Per-bucket LLM extraction with citation verification — log-and-
+      1. bucket_loader fetches and shapes source items into buckets.
+         Each item is {"id", "source_text"}.
+      2. Per-bucket LLM extraction with citation verification — log-and-
          continue on failure. Abort if <min_bucket_success_ratio succeed.
-      4. LLM synthesis via source-index merging (no hallucinated evidence).
-      5. Archive prior active claims for (creator_id, pass_name).
-      6. Insert canonical claims.
+      3. LLM synthesis via source-index merging (no hallucinated evidence).
+      4. Archive prior active claims for (creator_id, pass_name).
+      5. Insert canonical claims.
 
-    Pass-specific modules (lexical_voice, structural_voice, topical_voice,
-    ...) wrap this with their own pass_name and prompts.
+    evidence_source determines the LLM tool's citation field, the user-
+    message XML wrapping, and the verification key. Voice passes use
+    VIDEO_TRANSCRIPT; avatar uses COMMENT_TEXT.
 
-    Returns counts and cost: {buckets_total, buckets_succeeded,
-    intermediate_claims, canonical_claims_written, cost_usd}. cost_usd is
-    summed across all real Anthropic calls; stub llm_calls produce zero.
+    Returns {buckets_total, buckets_succeeded, intermediate_claims,
+    canonical_claims_written, cost_usd}. cost_usd is summed across all
+    real Anthropic calls; stub llm_calls produce zero.
     """
-    pa_rows = (
-        sb.table("platform_accounts")
-        .select("id")
-        .eq("creator_id", creator_id)
-        .execute()
-    ).data
-    if not pa_rows:
-        raise ValueError(f"No platform_accounts for creator_id={creator_id}")
-    pa_ids = [r["id"] for r in pa_rows]
-
-    videos = (
-        sb.table("videos")
-        .select("id, transcript")
-        .in_("platform_account_id", pa_ids)
-        .not_.is_("transcript", "null")
-        .execute()
-    ).data
-    videos = [v for v in videos if v.get("transcript")]
-    if not videos:
-        raise ValueError(f"No transcripts found for creator_id={creator_id}")
-
-    rng = random.Random(creator_id)
-    rng.shuffle(videos)
-    buckets = [videos[i : i + bucket_size] for i in range(0, len(videos), bucket_size)]
+    buckets = bucket_loader(creator_id, sb)
+    if not buckets:
+        raise ValueError(
+            f"bucket_loader returned no buckets for creator_id={creator_id}"
+        )
+    item_total = sum(len(b) for b in buckets)
     print(
-        f"[{pass_name}] {len(videos)} transcripts → {len(buckets)} buckets "
-        f"of up to {bucket_size}"
+        f"[{pass_name}] {item_total} items → {len(buckets)} buckets"
     )
 
     intermediate: list[dict] = []
@@ -479,6 +571,7 @@ def run_extraction_pass(
                 system_prompt,
                 bucket,
                 sb,
+                evidence_source=evidence_source,
                 llm_call=llm_call,
                 write_to_db=False,
             )
@@ -510,7 +603,10 @@ def run_extraction_pass(
 
     print(f"[{pass_name}] synthesizing {len(intermediate)} intermediate claims...")
     synth_result = synthesize_claims(
-        intermediate, synthesis_prompt, llm_call=llm_call
+        intermediate,
+        synthesis_prompt,
+        evidence_source=evidence_source,
+        llm_call=llm_call,
     )
     canonical = synth_result["canonical_claims"]
     synth_usage = synth_result.get("anthropic_usage")
