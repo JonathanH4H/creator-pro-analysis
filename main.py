@@ -8,6 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 
+import lexical_voice
+import structural_voice
+import topical_voice
 from ingest import ingest_youtube_channel
 
 load_dotenv()
@@ -91,3 +94,57 @@ async def ingest_youtube(
     )
 
     return {"status": "accepted", "analysis_id": body.analysis_id}
+
+
+PASS_RUNNERS = {
+    "lexical_voice": lexical_voice.run_pass,
+    "structural_voice": structural_voice.run_pass,
+    "topical_voice": topical_voice.run_pass,
+}
+
+
+class ExtractDnaPassRequest(BaseModel):
+    analysis_id: str
+    creator_id: str
+    pass_name: str
+
+
+@app.post("/extract/dna-pass")
+def extract_dna_pass(
+    body: ExtractDnaPassRequest,
+    authorization: str | None = Header(default=None),
+):
+    """Run a single DNA extraction pass synchronously and return its result.
+
+    Inngest's extract-dna function calls this once per pass (lexical,
+    structural, topical) sequentially. Pass-level retries happen at the
+    Inngest step layer.
+
+    Status code semantics for retry classification:
+      - 5xx        → transient (Inngest retries)
+      - 4xx (400)  → permanent (NonRetriableError on the TS side)
+      - 401        → auth misconfig (permanent until env fixed)
+    """
+    verify_secret(authorization)
+    sb = get_supabase()
+
+    runner = PASS_RUNNERS.get(body.pass_name)
+    if runner is None:
+        raise HTTPException(
+            400,
+            f"Unknown pass_name '{body.pass_name}'. "
+            f"Valid: {sorted(PASS_RUNNERS.keys())}",
+        )
+
+    try:
+        result = runner(body.creator_id, sb)
+    except ValueError as e:
+        # Bad input — no transcripts, no platform_account, etc. Permanent.
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        # Anthropic transport / runtime errors. Treat as transient by default
+        # so Inngest retries; persistent failures will exhaust retries and
+        # surface as dna_pass_runs.status='failed'.
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+    return result
