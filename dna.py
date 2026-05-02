@@ -25,6 +25,15 @@ from supabase import Client
 
 MODEL = "claude-sonnet-4-6"
 
+# Anthropic per-token pricing in USD. Source: https://www.anthropic.com/pricing
+# Used by run_extraction_pass to estimate cost_usd from streamed usage data.
+MODEL_PRICING_USD: dict[str, dict[str, float]] = {
+    "claude-sonnet-4-6": {
+        "input": 3.0 / 1_000_000,
+        "output": 15.0 / 1_000_000,
+    },
+}
+
 
 RECORD_CLAIMS_TOOL = {
     "name": "record_claims",
@@ -100,7 +109,12 @@ def _default_llm_call(system_prompt: str, user_message: str) -> dict:
         )
     for block in response.content:
         if getattr(block, "type", None) == "tool_use" and block.name == "record_claims":
-            return block.input
+            tool_input = dict(block.input) if isinstance(block.input, dict) else {}
+            tool_input["_anthropic_usage"] = {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            }
+            return tool_input
     raise RuntimeError("Anthropic response did not include record_claims tool use")
 
 
@@ -163,7 +177,12 @@ def _default_synthesis_call(system_prompt: str, user_message: str) -> dict:
             getattr(block, "type", None) == "tool_use"
             and block.name == "record_canonical_claims"
         ):
-            return block.input
+            tool_input = dict(block.input) if isinstance(block.input, dict) else {}
+            tool_input["_anthropic_usage"] = {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            }
+            return tool_input
     raise RuntimeError(
         "Anthropic response did not include record_canonical_claims tool use"
     )
@@ -248,6 +267,10 @@ def extract_claims_from_bucket(
 
     user_message = _build_user_message(video_bucket)
     response = llm(system_prompt, user_message)
+    # Extract usage out of the LLM result so it doesn't leak into claim dicts
+    # written downstream. Stubs that don't populate _anthropic_usage produce
+    # None — the orchestrator's cost aggregation treats that as zero.
+    usage = response.pop("_anthropic_usage", None)
     raw_claims = response.get("claims", [])
 
     accepted: list[dict] = []
@@ -288,6 +311,7 @@ def extract_claims_from_bucket(
         "rejected": len(rejected_reasons),
         "rejected_reasons": rejected_reasons,
         "accepted_claims": accepted,
+        "anthropic_usage": usage,
     }
 
 
@@ -296,7 +320,7 @@ def synthesize_claims(
     system_prompt: str,
     *,
     llm_call: LlmCall | None = None,
-) -> list[dict]:
+) -> dict[str, Any]:
     """Merge per-bucket claims into canonical claims via source-index merging.
 
     The LLM emits canonical_claims with source_claim_indexes pointing into
@@ -305,12 +329,13 @@ def synthesize_claims(
     (video_id, exact_quote)). The LLM never emits evidence, so hallucinated
     quotes are structurally impossible.
 
-    Returns canonical claims with shape {claim_text, confidence_score,
-    evidence}. Empty list if input is empty or LLM produces no usable
-    canonical claims.
+    Returns {"canonical_claims": [...], "anthropic_usage": dict | None}.
+    canonical_claims is empty if input is empty or LLM produces no usable
+    canonical claims. anthropic_usage is None if the LLM call was a stub
+    that didn't populate _anthropic_usage.
     """
     if not input_claims:
-        return []
+        return {"canonical_claims": [], "anthropic_usage": None}
 
     llm = llm_call or _default_synthesis_call
 
@@ -321,6 +346,7 @@ def synthesize_claims(
     user_message = "\n".join(lines)
 
     response = llm(system_prompt, user_message)
+    usage = response.pop("_anthropic_usage", None)
     canonical = response.get("canonical_claims", [])
 
     n = len(input_claims)
@@ -349,7 +375,7 @@ def synthesize_claims(
             }
         )
 
-    return result
+    return {"canonical_claims": result, "anthropic_usage": usage}
 
 
 def write_canonical_claims(
@@ -408,8 +434,9 @@ def run_extraction_pass(
     Pass-specific modules (lexical_voice, structural_voice, topical_voice,
     ...) wrap this with their own pass_name and prompts.
 
-    Returns counts: {buckets_total, buckets_succeeded, intermediate_claims,
-    canonical_claims_written}.
+    Returns counts and cost: {buckets_total, buckets_succeeded,
+    intermediate_claims, canonical_claims_written, cost_usd}. cost_usd is
+    summed across all real Anthropic calls; stub llm_calls produce zero.
     """
     pa_rows = (
         sb.table("platform_accounts")
@@ -442,6 +469,8 @@ def run_extraction_pass(
 
     intermediate: list[dict] = []
     succeeded = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
     for i, bucket in enumerate(buckets):
         try:
             result = extract_claims_from_bucket(
@@ -458,6 +487,10 @@ def run_extraction_pass(
                 f"{result['written']} accepted, {result['rejected']} rejected"
             )
             intermediate.extend(result["accepted_claims"])
+            usage = result.get("anthropic_usage")
+            if usage:
+                total_input_tokens += usage.get("input_tokens", 0)
+                total_output_tokens += usage.get("output_tokens", 0)
             succeeded += 1
         except Exception as e:
             print(
@@ -476,9 +509,14 @@ def run_extraction_pass(
         raise RuntimeError("No claims extracted across all buckets. Aborting.")
 
     print(f"[{pass_name}] synthesizing {len(intermediate)} intermediate claims...")
-    canonical = synthesize_claims(
+    synth_result = synthesize_claims(
         intermediate, synthesis_prompt, llm_call=llm_call
     )
+    canonical = synth_result["canonical_claims"]
+    synth_usage = synth_result.get("anthropic_usage")
+    if synth_usage:
+        total_input_tokens += synth_usage.get("input_tokens", 0)
+        total_output_tokens += synth_usage.get("output_tokens", 0)
     if not canonical:
         raise RuntimeError("Synthesis returned 0 canonical claims. Aborting.")
     print(f"[{pass_name}] synthesized → {len(canonical)} canonical claims")
@@ -487,9 +525,16 @@ def run_extraction_pass(
         sb, creator_id, pass_name, canonical, model_version=MODEL
     )
 
+    pricing = MODEL_PRICING_USD.get(MODEL, {"input": 0.0, "output": 0.0})
+    cost_usd = (
+        total_input_tokens * pricing["input"]
+        + total_output_tokens * pricing["output"]
+    )
+
     return {
         "buckets_total": len(buckets),
         "buckets_succeeded": succeeded,
         "intermediate_claims": len(intermediate),
         "canonical_claims_written": written,
+        "cost_usd": cost_usd,
     }
