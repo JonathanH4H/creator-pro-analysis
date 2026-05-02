@@ -9,8 +9,76 @@ from transcripts import transcribe_video
 from youtube_client import YouTubeClient, YouTubeQuotaError, chunks
 
 
+# Transcript-source upgrade hierarchy. A new attempt overwrites an existing
+# transcript only if its rank is at least as high as what's already there.
+# Equal rank = re-attempt (treated as overwrite). Lower rank = preserve.
+# null and 'unavailable' are equivalent at the bottom — both mean "no
+# usable transcript stored." Keys must match the strings transcribe_video
+# returns plus the literal None key for absent rows.
+TRANSCRIPT_RANK: dict[str | None, int] = {
+    None: 0,
+    "unavailable": 0,
+    "youtube-transcript-api": 1,
+    "whisper": 2,
+}
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _should_write_transcript(
+    existing_source: str | None, new_source: str | None
+) -> bool:
+    """True if the new attempt should overwrite the existing row.
+
+    Rule: write if new_rank >= existing_rank. Equal-rank re-attempts
+    overwrite (a fresh whisper run replaces a stale whisper transcript).
+    Lower-rank attempts (e.g., a failed yta on a row that has whisper)
+    are dropped to preserve the existing better transcript.
+    """
+    return TRANSCRIPT_RANK.get(new_source, 0) >= TRANSCRIPT_RANK.get(
+        existing_source, 0
+    )
+
+
+def _upsert_transcript(
+    sb: Client,
+    platform_account_id: str,
+    platform_video_id: str,
+    new_text: str | None,
+    new_source: str,
+) -> bool:
+    """Read-then-write wrapper around the transcript upsert with the
+    upgrade-hierarchy gate. Returns True if written, False if preserved.
+
+    Single entry point for transcript writes — both the chunk 4 and chunk
+    6 paths funnel through here. If a future code path bypasses this and
+    writes (transcript, transcript_source) directly, the bug returns.
+    """
+    existing = (
+        sb.table("videos")
+        .select("transcript_source")
+        .eq("platform_account_id", platform_account_id)
+        .eq("platform_video_id", platform_video_id)
+        .single()
+        .execute()
+    ).data
+    existing_source = (existing or {}).get("transcript_source")
+
+    if not _should_write_transcript(existing_source, new_source):
+        print(
+            f"[transcripts] preserving {existing_source} for "
+            f"{platform_video_id} (new attempt: {new_source})"
+        )
+        return False
+
+    sb.table("videos").update(
+        {"transcript": new_text, "transcript_source": new_source}
+    ).eq("platform_account_id", platform_account_id).eq(
+        "platform_video_id", platform_video_id
+    ).execute()
+    return True
 
 
 def _emit_progress(
@@ -149,11 +217,13 @@ def ingest_youtube_channel(
             text, source = transcribe_video(
                 v["platform_video_id"], use_whisper=use_whisper
             )
-            sb.table("videos").update(
-                {"transcript": text, "transcript_source": source}
-            ).eq("platform_account_id", platform_account_id).eq(
-                "platform_video_id", v["platform_video_id"]
-            ).execute()
+            _upsert_transcript(
+                sb,
+                platform_account_id,
+                v["platform_video_id"],
+                text,
+                source,
+            )
             if (i + 1) % 10 == 0 or (i + 1) == total_new:
                 _emit_progress(
                     sb, analysis_id, stage="fetching_transcripts",
