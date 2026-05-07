@@ -1,5 +1,6 @@
 import asyncio
 import os
+import traceback
 from typing import Any
 
 from dotenv import load_dotenv
@@ -14,6 +15,7 @@ import performance_profile
 import structural_voice
 import topical_voice
 from ingest import ingest_youtube_channel
+from peer_sweep import run_peer_sweep
 
 load_dotenv()
 app = FastAPI(title="Creator Pro Analysis Service")
@@ -51,6 +53,32 @@ def verify_secret(authorization: str | None):
         raise HTTPException(401, "Unauthorized")
 
 
+def _log_task_exception(label: str):
+    """Returns a done-callback that logs unhandled exceptions from
+    asyncio.create_task(...). Without this, exceptions raised inside the
+    background task are dropped on the floor — the task object holds the
+    exception but nothing ever calls .result() / .exception() on it. We've
+    been bitten by this before in Phase 1a.
+    """
+
+    def _cb(task: asyncio.Task):
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        tb = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        print(
+            f"[main] {label} background task failed: "
+            f"{type(exc).__name__}: {exc}\n{tb}",
+            flush=True,
+        )
+
+    return _cb
+
+
 @app.get("/")
 def root():
     return {"service": "creator-pro-analysis", "status": "ok"}
@@ -85,7 +113,7 @@ async def ingest_youtube(
     # Inngest's MAX_POLLS timeout marks the function failed). Migrate to a real
     # task queue (Celery / Arq / RQ) before scaling beyond internal — see
     # PRE_LAUNCH_TODO.md "Reliability".
-    asyncio.create_task(
+    task = asyncio.create_task(
         asyncio.to_thread(
             ingest_youtube_channel,
             sb,
@@ -94,8 +122,40 @@ async def ingest_youtube(
             body.config,
         )
     )
+    task.add_done_callback(
+        _log_task_exception(f"ingest_youtube analysis_id={body.analysis_id}")
+    )
 
     return {"status": "accepted", "analysis_id": body.analysis_id}
+
+
+class SweepPeerRequest(BaseModel):
+    peer_creator_id: str
+
+
+@app.post("/sweep/peer", status_code=202)
+async def sweep_peer(
+    body: SweepPeerRequest,
+    authorization: str | None = Header(default=None),
+):
+    """Background-task kickoff for one peer sweep. Same pattern as
+    /ingest/youtube: returns 202 immediately, runs run_peer_sweep in a
+    worker thread. The TS Inngest function (sweep-peer) polls
+    peer_creators.peer_sweep_status until terminal.
+    """
+    verify_secret(authorization)
+    sb = get_supabase()
+
+    task = asyncio.create_task(
+        asyncio.to_thread(run_peer_sweep, sb, body.peer_creator_id)
+    )
+    task.add_done_callback(
+        _log_task_exception(
+            f"run_peer_sweep peer_creator_id={body.peer_creator_id}"
+        )
+    )
+
+    return {"status": "accepted", "peer_creator_id": body.peer_creator_id}
 
 
 PASS_RUNNERS = {
