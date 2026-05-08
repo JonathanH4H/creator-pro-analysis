@@ -203,28 +203,31 @@ def run_peer_sweep(sb: Client, peer_creator_id: str) -> dict[str, Any]:
             "peer_creator_id", peer_creator_id
         ).execute()
 
-        # Stage 5: upsert outliers + fetch transcripts (rank-aware preserve).
-        # Cost accounting: only count Whisper minutes for videos we actually
-        # transcribed in this sweep (skipping cached whisper hits saves $$).
+        # Stage 5a (1c.3a): metadata for ALL videos in window. Cheap — pure
+        # DB writes, no API calls. is_outlier is set per-video based on the
+        # current outlier set; outlier_score = view_count / median is
+        # computed for every video (not just outliers — useful for
+        # downstream sorting and 1c.4 pattern extraction). Transcript
+        # columns are omitted from the payload so existing transcripts on
+        # outlier rows survive the upsert.
+        outlier_pvids = {v["platform_video_id"] for v in outliers}
+        print(
+            f"[peer_sweep] {peer_creator_id}: phase=metadata starting: {len(in_window)} videos",
+            flush=True,
+        )
         _emit_progress(
             sb,
             peer_creator_id,
-            stage="ingesting_outliers",
+            stage="ingesting_metadata",
             current=0,
-            total=len(outliers),
+            total=len(in_window),
         )
-        whisper_cost_usd = 0.0
-        for i, v in enumerate(outliers):
+        for i, v in enumerate(in_window):
             pvid = v["platform_video_id"]
             view_count = v.get("view_count") or 0
             outlier_score = (
                 round(view_count / peer_median, 4) if peer_median else None
             )
-
-            # Upsert metadata first. Payload omits transcript columns so an
-            # existing transcript on this row is preserved through the
-            # upsert. supabase-py upsert generates ON CONFLICT DO UPDATE
-            # SET only for the columns in the payload.
             sb.table("peer_videos").upsert(
                 {
                     "peer_creator_id": peer_creator_id,
@@ -238,10 +241,36 @@ def run_peer_sweep(sb: Client, peer_creator_id: str) -> dict[str, Any]:
                     "published_at": v.get("published_at"),
                     "thumbnail_url": v.get("thumbnail_url"),
                     "outlier_score": outlier_score,
-                    "is_outlier": True,
+                    "is_outlier": pvid in outlier_pvids,
                 },
                 on_conflict="peer_creator_id,platform_video_id",
             ).execute()
+            if (i + 1) % 25 == 0 or (i + 1) == len(in_window):
+                _emit_progress(
+                    sb,
+                    peer_creator_id,
+                    stage="ingesting_metadata",
+                    current=i + 1,
+                    total=len(in_window),
+                )
+        print(
+            f"[peer_sweep] {peer_creator_id}: phase=metadata complete: {len(in_window)} upserted",
+            flush=True,
+        )
+
+        # Stage 5b: transcripts for outliers only. Rank-aware preserve so we
+        # don't re-pay Whisper for cached transcripts. Cost accounting only
+        # counts Whisper minutes for fresh fetches.
+        _emit_progress(
+            sb,
+            peer_creator_id,
+            stage="fetching_transcripts",
+            current=0,
+            total=len(outliers),
+        )
+        whisper_cost_usd = 0.0
+        for i, v in enumerate(outliers):
+            pvid = v["platform_video_id"]
 
             existing = (
                 sb.table("peer_videos")
@@ -253,7 +282,7 @@ def run_peer_sweep(sb: Client, peer_creator_id: str) -> dict[str, Any]:
             ).data
             existing_source = (existing or {}).get("transcript_source")
             print(
-                f"[peer_sweep] {peer_creator_id}: outlier {i+1}/{len(outliers)} {pvid}: existing_source={existing_source}",
+                f"[peer_sweep] {peer_creator_id}: phase=transcripts, processing outlier {i+1}/{len(outliers)} {pvid}: existing_source={existing_source}",
                 flush=True,
             )
 
@@ -270,7 +299,7 @@ def run_peer_sweep(sb: Client, peer_creator_id: str) -> dict[str, Any]:
                 _emit_progress(
                     sb,
                     peer_creator_id,
-                    stage="ingesting_outliers",
+                    stage="fetching_transcripts",
                     current=i + 1,
                     total=len(outliers),
                 )
@@ -297,7 +326,7 @@ def run_peer_sweep(sb: Client, peer_creator_id: str) -> dict[str, Any]:
             _emit_progress(
                 sb,
                 peer_creator_id,
-                stage="ingesting_outliers",
+                stage="fetching_transcripts",
                 current=i + 1,
                 total=len(outliers),
             )
@@ -312,6 +341,7 @@ def run_peer_sweep(sb: Client, peer_creator_id: str) -> dict[str, Any]:
                 "median_view_count": peer_median,
                 "last_sweep_cost_usd": round(whisper_cost_usd, 4),
                 "last_sweep_outlier_count": len(outliers),
+                "last_sweep_total_videos": len(in_window),
                 "last_sweep_window_days": WINDOW_DAYS,
                 "last_sweep_threshold_ratio": THRESHOLD_RATIO,
                 "last_sweep_error": None,
@@ -324,7 +354,7 @@ def run_peer_sweep(sb: Client, peer_creator_id: str) -> dict[str, Any]:
             }
         ).eq("id", peer_creator_id).execute()
         print(
-            f"[peer_sweep] {peer_creator_id}: complete: {len(outliers)} outliers, ${whisper_cost_usd:.2f} total, median={peer_median}",
+            f"[peer_sweep] {peer_creator_id}: complete: {len(in_window)} videos catalogued, {len(outliers)} outliers, ${whisper_cost_usd:.2f} total, median={peer_median}",
             flush=True,
         )
 
