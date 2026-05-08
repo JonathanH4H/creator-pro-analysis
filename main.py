@@ -15,6 +15,7 @@ import performance_profile
 import structural_voice
 import topical_voice
 from ingest import ingest_youtube_channel
+from peer_pattern_extraction import run_peer_pattern_extraction
 from peer_sweep import run_peer_sweep
 
 load_dotenv()
@@ -152,6 +153,37 @@ async def sweep_peer(
     task.add_done_callback(
         _log_task_exception(
             f"run_peer_sweep peer_creator_id={body.peer_creator_id}"
+        )
+    )
+
+    return {"status": "accepted", "peer_creator_id": body.peer_creator_id}
+
+
+class ExtractPeerPatternsRequest(BaseModel):
+    peer_creator_id: str
+
+
+@app.post("/extract-patterns/peer", status_code=202)
+async def extract_peer_patterns(
+    body: ExtractPeerPatternsRequest,
+    authorization: str | None = Header(default=None),
+):
+    """Background-task kickoff for one peer's pattern extraction. Same
+    pattern as /sweep/peer: returns 202 immediately, runs the extraction
+    in a worker thread. The TS Inngest function (extract-peer-patterns)
+    polls the latest peer_pattern_extractions row for terminal status.
+    """
+    verify_secret(authorization)
+    sb = get_supabase()
+
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            run_peer_pattern_extraction, sb, body.peer_creator_id
+        )
+    )
+    task.add_done_callback(
+        _log_task_exception(
+            f"run_peer_pattern_extraction peer_creator_id={body.peer_creator_id}"
         )
     )
 
