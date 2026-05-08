@@ -16,6 +16,7 @@ import structural_voice
 import topical_voice
 from ingest import ingest_youtube_channel
 from peer_pattern_extraction import run_peer_pattern_extraction
+from peer_suggestion import run_peer_suggestion
 from peer_sweep import run_peer_sweep
 
 load_dotenv()
@@ -157,6 +158,41 @@ async def sweep_peer(
     )
 
     return {"status": "accepted", "peer_creator_id": body.peer_creator_id}
+
+
+class SuggestPeersRequest(BaseModel):
+    creator_id: str
+    operator_context: str | None = None
+
+
+@app.post("/suggest-peers/creator", status_code=202)
+async def suggest_peers(
+    body: SuggestPeersRequest,
+    authorization: str | None = Header(default=None),
+):
+    """Background-task kickoff for one creator's peer-suggestion run.
+    Same pattern as /sweep/peer and /extract-patterns/peer: 202 + asyncio
+    task. The TS Inngest function (suggest-peers) polls peer_suggestions
+    for rows with this creator_id and generated_at >= anchor.
+    """
+    verify_secret(authorization)
+    sb = get_supabase()
+
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            run_peer_suggestion,
+            sb,
+            body.creator_id,
+            body.operator_context,
+        )
+    )
+    task.add_done_callback(
+        _log_task_exception(
+            f"run_peer_suggestion creator_id={body.creator_id}"
+        )
+    )
+
+    return {"status": "accepted", "creator_id": body.creator_id}
 
 
 class ExtractPeerPatternsRequest(BaseModel):
