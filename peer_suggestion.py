@@ -44,6 +44,14 @@ TEXT_PASS_NAMES = (
 
 YT_API = "https://www.googleapis.com/youtube/v3"
 
+# Hallucination guard: forHandle resolves "this handle exists on YouTube"
+# but doesn't distinguish a real active channel from an empty account
+# someone registered the handle on. Channels failing either threshold
+# get validated=false; their actual_* fields still populate so the
+# operator sees the real numbers and can decide manually.
+MIN_SUBSCRIBER_COUNT = 1000
+MIN_VIDEO_COUNT = 5
+
 
 SYSTEM_PROMPT = """You are an expert content analyst at a creator-management agency. Your job: identify 10-15 candidate YouTube CHANNELS that this managed creator's agency should monitor as PEERS.
 
@@ -410,6 +418,7 @@ def _validate_via_youtube(handle: str) -> dict | None:
             "handle": snippet.get("customUrl"),
             "display_name": snippet.get("title"),
             "subscriber_count": int(statistics.get("subscriberCount") or 0),
+            "video_count": int(statistics.get("videoCount") or 0),
         }
     except Exception as e:
         print(
@@ -502,12 +511,31 @@ def run_peer_suggestion(
                 "llm_output_tokens": meta["output_tokens"],
             }
             if validation:
-                row["validated"] = True
+                sub_count = validation["subscriber_count"]
+                video_count = validation["video_count"]
+                threshold_pass = (
+                    sub_count >= MIN_SUBSCRIBER_COUNT
+                    and video_count >= MIN_VIDEO_COUNT
+                )
+                # actual_* always populated when forHandle resolved, so
+                # the UI can show real numbers even on threshold failures.
+                # validated only flips true when thresholds pass.
                 row["actual_channel_id"] = validation["channel_id"]
                 row["actual_handle"] = validation["handle"]
                 row["actual_display_name"] = validation["display_name"]
-                row["actual_subscriber_count"] = validation["subscriber_count"]
-                validated_count += 1
+                row["actual_subscriber_count"] = sub_count
+                row["actual_video_count"] = video_count
+                if threshold_pass:
+                    row["validated"] = True
+                    validated_count += 1
+                else:
+                    print(
+                        f"[peer_suggest] {creator_id}: threshold failed "
+                        f"for {handle_guess}: subs={sub_count}, "
+                        f"videos={video_count} (min subs={MIN_SUBSCRIBER_COUNT}, "
+                        f"min videos={MIN_VIDEO_COUNT})",
+                        flush=True,
+                    )
             rows.append(row)
 
         print(
