@@ -15,6 +15,7 @@ import performance_profile
 import structural_voice
 import topical_voice
 from ingest import ingest_youtube_channel
+from niche_aggregation import run_niche_aggregation
 from peer_pattern_extraction import run_peer_pattern_extraction
 from peer_suggestion import run_peer_suggestion
 from peer_sweep import run_peer_sweep
@@ -158,6 +159,35 @@ async def sweep_peer(
     )
 
     return {"status": "accepted", "peer_creator_id": body.peer_creator_id}
+
+
+class AggregateNicheRequest(BaseModel):
+    creator_id: str
+
+
+@app.post("/aggregate-niche/creator", status_code=202)
+async def aggregate_niche(
+    body: AggregateNicheRequest,
+    authorization: str | None = Header(default=None),
+):
+    """Background-task kickoff for one creator's niche aggregation. Same
+    pattern as /extract-patterns/peer: 202 + asyncio task. The TS Inngest
+    function (aggregate-niche) polls niche_pattern_aggregations for the
+    latest row created at-or-after the API call anchor.
+    """
+    verify_secret(authorization)
+    sb = get_supabase()
+
+    task = asyncio.create_task(
+        asyncio.to_thread(run_niche_aggregation, sb, body.creator_id)
+    )
+    task.add_done_callback(
+        _log_task_exception(
+            f"run_niche_aggregation creator_id={body.creator_id}"
+        )
+    )
+
+    return {"status": "accepted", "creator_id": body.creator_id}
 
 
 class SuggestPeersRequest(BaseModel):
